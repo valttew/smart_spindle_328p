@@ -9,72 +9,187 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/eeprom.h>
+#include <avr/pgmspace.h>
 #include <util/delay.h>
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
 
-#define HALL_PIN0 PD2
-#define HALL_PIN1 PD3
-#define HALL_PIN2 PD4
-#define BUTTON_PIN PD5
-#define ESC_PIN PB1
+#define HALL_PIN0            PD2
+#define HALL_PIN1            PD3
+#define HALL_PIN2            PD4
+#define BUTTON_PIN           PD5
+#define ESC_PIN              PB1
 
-#define PULSES_PER_REV 84
-#define PWM_MIN 2000
-#define PWM_MAX 4000
+#define PULSES_PER_REV       84
 
-#define RPM_FILTER_ALPHA 0.2
-#define RPM_CHECK_TIMEOUT 3000
+#define PWM_MIN              2000
+#define PWM_MAX              4000
+#define PWM_SCALE            255.0f
 
-volatile int pulseCount = 0;
-uint8_t lastHallState = 0;
+#define RPM_FILTER_ALPHA     0.2f
 
-float Kp, Ki;
-volatile float targetRPM = 4000;
-float integral = 0;
-float pwmOutput = 0;
-float currentRPM = 0;
-float filteredRPM = 0;
+#define RPM_CHECK_TIMEOUT_MS 3000
 
-uint32_t lastRPMCalc = 0;
-uint32_t lastPID = 0;
-uint32_t lastButtonPress = 0;
-uint32_t lastRPMNonZero = 0;
+#define AUTO_TUNE_INIT_DELAY_MS 1000
+#define AUTO_TUNE_PERIODS       6
+#define AUTO_TUNE_RELAY_HIGH    140
+#define AUTO_TUNE_RELAY_LOW     100
 
+#define DEFAULT_KP           0.02f
+#define DEFAULT_KI           0.1f
+#define K_MAX                100.0f
+#define INTEGRAL_MAX         500.0f
+
+#define TARGET_RPM_MIN       0.0f
+#define TARGET_RPM_MAX       20000.0f
+
+// Clamp macro
+#define constrain(x, lo, hi) (((x)<(lo))?(lo):(((x)>(hi))?(hi):(x)))
+
+// ——————— EEPROM variables ————————
 float EEMEM ee_Kp;
 float EEMEM ee_Ki;
 
+// —————— Runtime state ———————
+volatile uint32_t timer0_millis = 0;
+volatile int      pulseCount     = 0;
+volatile uint8_t  lastHallState  = 0;
+volatile uint32_t lastRPMNonZero = 0;
+
+// Auto-tune state machine
+volatile bool     autoTuneActive = false;
+enum {
+    AT_IDLE,
+    AT_WAIT_INIT,
+    AT_TUNING
+} atState = AT_IDLE;
+uint32_t  atLastCrossTime = 0;
+uint8_t   atPeriodCount   = 0;
+float     atHalfPeriods[AUTO_TUNE_PERIODS];
+bool      atAbove        = false;
+
+// Serial Rx buffer
 #define RX_BUF_SIZE 64
 char rxBuffer[RX_BUF_SIZE];
 volatile uint8_t rxHead = 0, rxTail = 0;
 
-volatile uint32_t timer0_millis = 0;
-ISR(TIMER0_COMPA_vect) { timer0_millis++; }
+// Target and measured speed
+volatile float targetRPM = 4000.0f;
+float currentRPM = 0.0f, filteredRPM = 0.0f;
+
+// ————— PID Struct —————
+typedef struct {
+    float Kp, Ki;
+    float integral;
+    uint32_t lastTime;
+} PID_t;
+
+PID_t pid;
+
+// ——————— Helper: print from Flash ——————
+void uart_putc(char c) {
+    while (!(UCSR0A & (1 << UDRE0)));
+    UDR0 = c;
+}
+
+void uart_print_P(const __FlashStringHelper* flash) {
+    const char* p = (const char*)flash;
+    char c;
+    while ((c = pgm_read_byte(p++))) uart_putc(c);
+}
+
+void uart_println_P(const __FlashStringHelper* flash) {
+    uart_print_P(flash);
+    uart_putc('\n');
+}
+
+void uart_print(const char* s) {
+    while (*s) uart_putc(*s++);
+}
+
+void uart_println(const char* s) {
+    uart_print(s);
+    uart_putc('\n');
+}
+
+void uart_print_float(float x) {
+    char buf[16];
+    dtostrf(x, 1, 2, buf);
+    uart_print(buf);
+}
+
+// ————— Timer0: 1 ms tick ————
+ISR(TIMER0_COMPA_vect) {
+    timer0_millis++;
+}
+
+// ——————— Hall sensor PCINT ————————
+ISR(PCINT2_vect) {
+    uint8_t state = (((PIND & (1 << HALL_PIN0)) ? 1 : 0) << 2)
+                  | (((PIND & (1 << HALL_PIN1)) ? 1 : 0) << 1)
+                  |  ((PIND & (1 << HALL_PIN2)) ? 1 : 0);
+    if (state != lastHallState) {
+        pulseCount++;
+        lastHallState = state;
+        lastRPMNonZero = timer0_millis;
+    }
+}
+
+// —————— UART Rx ————
 ISR(USART_RX_vect) {
     uint8_t next = (rxHead + 1) % RX_BUF_SIZE;
-    if (next != rxTail) { rxBuffer[rxHead] = UDR0; rxHead = next; }
+    if (next != rxTail) {
+        rxBuffer[rxHead] = UDR0;
+        rxHead = next;
+    }
 }
 
-void setupTimers() {
-    TCCR0A = (1 << WGM01);
-    OCR0A = 249;
-    TIMSK0 = (1 << OCIE0A);
-    TCCR0B = (1 << CS01) | (1 << CS00);
+// ——————— Millis helper (atomic) ————————
+uint32_t millis() {
+    uint32_t m;
+    cli();
+    m = timer0_millis;
+    sei();
+    return m;
 }
 
-void uart_init(uint16_t ubrr) {
-    UBRR0H = (ubrr >> 8); UBRR0L = ubrr;
-    UCSR0B = (1 << TXEN0) | (1 << RXEN0) | (1 << RXCIE0);
-    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+// —————— PWM setup ————————
+void pwm_setup() {
+    TCCR1A = (1 << COM1A1) | (1 << WGM11);
+    TCCR1B = (1 << WGM12)  | (1 << WGM13) | (1 << CS11);
+    ICR1   = 39999;        // 50 Hz base
 }
 
-void uart_putc(char c) { while (!(UCSR0A & (1 << UDRE0))); UDR0 = c; }
-void uart_print(const char* s) { for (; *s; s++) uart_putc(*s); }
-void uart_println(const char* s) { uart_print(s); uart_putc('\n'); }
-void uart_print_float(float x) { char buf[16]; dtostrf(x, 1, 2, buf); uart_print(buf); }
+void pwm_write(uint16_t val) {
+    OCR1A = val;
+}
 
-bool uart_available() { return rxHead != rxTail; }
+uint16_t pwm_map(float pwm) {
+    return PWM_MIN
+         + (uint16_t)(pwm * ((PWM_MAX - PWM_MIN) / PWM_SCALE));
+}
+
+// ——————— PID update (called every ~20 ms) —————
+void doPID() {
+    uint32_t now = millis();
+    float dt = (now - pid.lastTime) / 1000.0f;
+    if (dt <= 0) dt = 0.001f;
+    pid.lastTime = now;
+
+    float error = targetRPM - currentRPM;
+    pid.integral = constrain(pid.integral + error * dt, -INTEGRAL_MAX, INTEGRAL_MAX);
+
+    float output = pid.Kp * error + pid.Ki * pid.integral;
+    output = constrain(output, 0.0f, PWM_SCALE);
+    pwm_write(pwm_map(output));
+}
+
+// ————— Serial command parser ——————
+bool uart_available() {
+    return rxHead != rxTail;
+}
+
 char uart_read() {
     if (rxHead == rxTail) return 0;
     char c = rxBuffer[rxTail];
@@ -82,120 +197,184 @@ char uart_read() {
     return c;
 }
 
-uint8_t readHallState() {
-    return (((PIND & (1 << HALL_PIN0)) ? 1 : 0) << 2) |
-           (((PIND & (1 << HALL_PIN1)) ? 1 : 0) << 1) |
-           ((PIND & (1 << HALL_PIN2)) ? 1 : 0);
-}
-
-uint32_t millis() { uint32_t m; cli(); m = timer0_millis; sei(); return m; }
-
-void pwm_setup() {
-    TCCR1A = (1 << COM1A1) | (1 << WGM11);
-    TCCR1B = (1 << WGM12) | (1 << WGM13) | (1 << CS11);
-    ICR1 = 39999;
-}
-void pwm_write(uint16_t val) { OCR1A = val; }
-uint16_t pwm_map(float pwm) { return PWM_MIN + (uint16_t)(pwm * ((PWM_MAX - PWM_MIN) / 255.0)); }
-
-void doPID() {
-    float error = targetRPM - currentRPM;
-    integral += error * 0.02;
-    if (integral > 500) integral = 500;
-    if (integral < -500) integral = -500;
-    pwmOutput += Kp * error + Ki * integral;
-    if (pwmOutput < 0) pwmOutput = 0;
-    if (pwmOutput > 255) pwmOutput = 255;
-    pwm_write(pwm_map(pwmOutput));
-}
-
-void relayAutoTune() {
-    float relayHigh = 140, relayLow = 100, halfPeriods[6];
-    uint8_t periodCount = 0;
-    bool above = currentRPM > targetRPM;
-    pwmOutput = relayLow; pwm_write(pwm_map(pwmOutput)); _delay_ms(1000);
-    uint32_t lastCrossTime = millis();
-    while (periodCount < 6) {
-        if (above && currentRPM < targetRPM) {
-            pwmOutput = relayHigh; pwm_write(pwm_map(pwmOutput));
-            uint32_t now = millis(); halfPeriods[periodCount++] = (now - lastCrossTime) / 1000.0; lastCrossTime = now; above = false;
-        } else if (!above && currentRPM > targetRPM) {
-            pwmOutput = relayLow; pwm_write(pwm_map(pwmOutput));
-            uint32_t now = millis(); halfPeriods[periodCount++] = (now - lastCrossTime) / 1000.0; lastCrossTime = now; above = true;
-        }
-    }
-    float sum = 0; for (uint8_t i=0;i<6;i++) sum += halfPeriods[i];
-    float Pu = (sum/6.0) * 2.0, deltaPWM = relayHigh-relayLow, deltaRPM = targetRPM*0.2;
-    float Ku = (4.0/3.1415)*(deltaPWM/(deltaRPM>0?deltaRPM:1));
-    Kp=0.6*Ku; Ki=1.2*Ku/Pu;
-    eeprom_write_block((const void*)&Kp, &ee_Kp, sizeof(float));
-    eeprom_write_block((const void*)&Ki, &ee_Ki, sizeof(float));
-    uart_println("Relay auto-tune complete:");
-    uart_print("Pu: "); uart_print_float(Pu); uart_println("");
-    uart_print("Ku: "); uart_print_float(Ku); uart_println("");
-    uart_print("Kp: "); uart_print_float(Kp); uart_println("");
-    uart_print("Ki: "); uart_print_float(Ki); uart_println("");
-}
-
 void handleSerial() {
-    static char line[32]; static uint8_t pos = 0;
+    static char line[32];
+    static uint8_t pos = 0;
+
     while (uart_available()) {
         char c = uart_read();
         if (c == '\n' || c == '\r') {
-            line[pos] = 0; pos = 0;
+            line[pos] = '\0';
+            pos = 0;
             if (line[0] == 'S') {
-                float newRPM = atof(&line[1]);
-                if (newRPM >= 0 && newRPM <= 20000) {
-                    targetRPM = newRPM; integral = 0;
-                    uart_print("New targetRPM: "); uart_print_float(targetRPM); uart_println("");
+                float v = atof(&line[1]);
+                if (v >= TARGET_RPM_MIN && v <= TARGET_RPM_MAX) {
+                    targetRPM = v;
+                    pid.integral = 0;
+                    uart_print_P(PSTR("New targetRPM: "));
+                    uart_print_float(targetRPM);
+                    uart_putc('\n');
                 }
-            } else if (line[0] == 'P') {
+            }
+            else if (line[0] == 'P') {
                 char* kpStr = strtok(&line[1], ",");
                 char* kiStr = strtok(NULL, ",");
                 if (kpStr && kiStr) {
-                    float newKp = atof(kpStr), newKi = atof(kiStr);
-                    if (newKp >= 0 && newKi >= 0 && newKp < 100 && newKi < 100) {
-                        Kp = newKp; Ki = newKi;
-                        eeprom_write_block(&Kp, &ee_Kp, sizeof(float));
-                        eeprom_write_block(&Ki, &ee_Ki, sizeof(float));
-                        uart_print("Saved Kp: "); uart_print_float(Kp);
-                        uart_print(" Ki: "); uart_print_float(Ki); uart_println("");
+                    float nk = atof(kpStr), ni = atof(kiStr);
+                    if (nk >= 0 && ni >= 0 && nk < K_MAX && ni < K_MAX) {
+                        pid.Kp = nk; pid.Ki = ni;
+                        eeprom_update_block(&pid.Kp, &ee_Kp, sizeof(pid.Kp));
+                        eeprom_update_block(&pid.Ki, &ee_Ki, sizeof(pid.Ki));
+                        uart_print_P(PSTR("Saved Kp: "));
+                        uart_print_float(pid.Kp);
+                        uart_print_P(PSTR(" Ki: "));
+                        uart_print_float(pid.Ki);
+                        uart_putc('\n');
                     }
                 }
             }
-        } else if (pos < sizeof(line) - 1) line[pos++] = c;
+        }
+        else if (pos < sizeof(line)-1) {
+            line[pos++] = c;
+        }
     }
 }
 
 int main() {
-    DDRD &= ~((1 << HALL_PIN0)|(1 << HALL_PIN1)|(1 << HALL_PIN2)|(1 << BUTTON_PIN));
-    PORTD |= (1 << HALL_PIN0)|(1 << HALL_PIN1)|(1 << HALL_PIN2)|(1 << BUTTON_PIN);
-    DDRB |= (1 << ESC_PIN);
-    setupTimers(); pwm_setup(); uart_init(16); sei();
-    eeprom_read_block(&Kp, &ee_Kp, sizeof(float));
-    eeprom_read_block(&Ki, &ee_Ki, sizeof(float));
-    if (isnan(Kp) || isnan(Ki) || Kp<0 || Ki<0 || Kp>100 || Ki>100) { Kp=0.02; Ki=0.1; }
-    uart_println("Spindle PID with EEPROM save & auto-tune Ready.");
-    lastHallState = readHallState();
+    // GPIO setup
+    DDRD  &= ~((1<<HALL_PIN0)|(1<<HALL_PIN1)|(1<<HALL_PIN2)|(1<<BUTTON_PIN));
+    PORTD |=  (1<<HALL_PIN0)|(1<<HALL_PIN1)|(1<<HALL_PIN2)|(1<<BUTTON_PIN);
+    DDRB  |=  (1<<ESC_PIN);
+
+    // Timer0 (millis)
+    TCCR0A = (1<<WGM01);
+    OCR0A  = 249;               // 1 kHz @ F_CPU=16 MHz
+    TIMSK0 = (1<<OCIE0A);
+    TCCR0B = (1<<CS01)|(1<<CS00);
+
+    pwm_setup();
+
+    // UART @115200 UBRR=16 @16 MHz
+    uint16_t ubrr = 16;
+    UBRR0H = ubrr>>8; UBRR0L = ubrr;
+    UCSR0B = (1<<TXEN0)|(1<<RXEN0)|(1<<RXCIE0);
+    UCSR0C = (1<<UCSZ01)|(1<<UCSZ00);
+
+    // Hall PCINT on PD2,PD3,PD4
+    PCICR  |= (1<<PCIE2);
+    PCMSK2 |= (1<<PCINT18)|(1<<PCINT19)|(1<<PCINT20);
+
+    sei();
+
+    // Load PID gains from EEPROM
+    eeprom_read_block(&pid.Kp, &ee_Kp, sizeof(pid.Kp));
+    eeprom_read_block(&pid.Ki, &ee_Ki, sizeof(pid.Ki));
+    if (isnan(pid.Kp) || isnan(pid.Ki)
+        || pid.Kp < 0 || pid.Ki < 0
+        || pid.Kp > K_MAX || pid.Ki > K_MAX) {
+        pid.Kp = DEFAULT_KP;
+        pid.Ki = DEFAULT_KI;
+    }
+    pid.integral = 0;
+    pid.lastTime = millis();
+
+    uart_println_P(PSTR("Spindle PID with EEPROM save & auto-tune Ready."));
+
+    lastHallState = (PIND>>HALL_PIN0)&0x07;
+
+    uint32_t lastRPMCalc = millis();
+
     while (1) {
         uint32_t now = millis();
+
         handleSerial();
-        if (!(PIND & (1 << BUTTON_PIN)) && (now - lastButtonPress > 500)) {
-            lastButtonPress = now; uart_println("Relay auto-tune triggered..."); relayAutoTune();
+
+        // Button --> start auto-tune
+        if (!(PIND & (1<<BUTTON_PIN))
+            && (now - atLastCrossTime > 500)
+            && !autoTuneActive)
+        {
+            atLastCrossTime = now;
+            atState         = AT_WAIT_INIT;
+            autoTuneActive  = true;
+            uart_println_P(PSTR("Relay auto-tune triggered..."));
         }
-        uint8_t hallState = readHallState();
-        if (hallState != lastHallState) { pulseCount++; lastHallState = hallState; }
+
+        // Auto-tune state machine non-blocking
+        if (autoTuneActive) {
+            switch (atState) {
+                case AT_WAIT_INIT:
+                    if (now - atLastCrossTime >= AUTO_TUNE_INIT_DELAY_MS) {
+                        // kick off at low
+                        pwm_write(pwm_map(AUTO_TUNE_RELAY_LOW));
+                        atAbove        = (currentRPM > targetRPM);
+                        atLastCrossTime= now;
+                        atPeriodCount  = 0;
+                        atState        = AT_TUNING;
+                    }
+                    break;
+
+                case AT_TUNING:
+                    if (atPeriodCount < AUTO_TUNE_PERIODS) {
+                        if (atAbove && currentRPM < targetRPM) {
+                            pwm_write(pwm_map(AUTO_TUNE_RELAY_HIGH));
+                            atHalfPeriods[atPeriodCount++] = (now - atLastCrossTime)/1000.0f;
+                            atLastCrossTime = now;
+                            atAbove = false;
+                        }
+                        else if (!atAbove && currentRPM > targetRPM) {
+                            pwm_write(pwm_map(AUTO_TUNE_RELAY_LOW));
+                            atHalfPeriods[atPeriodCount++] = (now - atLastCrossTime)/1000.0f;
+                            atLastCrossTime = now;
+                            atAbove = true;
+                        }
+                    }
+                    else {
+                        // compute Z-N parameters
+                        float sum=0;
+                        for(uint8_t i=0;i<AUTO_TUNE_PERIODS;i++) sum+=atHalfPeriods[i];
+                        float Pu = (sum/AUTO_TUNE_PERIODS)*2.0f;
+                        float deltaPWM = AUTO_TUNE_RELAY_HIGH - AUTO_TUNE_RELAY_LOW;
+                        float deltaRPM = targetRPM*0.2f;
+                        float Ku = (4.0f/3.14159265f)*(deltaPWM/(deltaRPM>0?deltaRPM:1.0f));
+                        pid.Kp = 0.6f*Ku;
+                        pid.Ki = 1.2f*Ku/Pu;
+                        eeprom_update_block(&pid.Kp, &ee_Kp, sizeof(pid.Kp));
+                        eeprom_update_block(&pid.Ki, &ee_Ki, sizeof(pid.Ki));
+
+                        uart_println_P(PSTR("Relay auto-tune complete:"));
+                        uart_print_P(PSTR("Pu: ")); uart_print_float(Pu); uart_putc('\n');
+                        uart_print_P(PSTR("Ku: ")); uart_print_float(Ku); uart_putc('\n');
+                        uart_print_P(PSTR("Kp: ")); uart_print_float(pid.Kp); uart_putc('\n');
+                        uart_print_P(PSTR("Ki: ")); uart_print_float(pid.Ki); uart_putc('\n');
+
+                        autoTuneActive = false;
+                    }
+                    break;
+            }
+        }
+
+        // RPM calculation every 100 ms
         if (now - lastRPMCalc >= 100) {
-            cli(); int count=pulseCount; pulseCount=0; sei();
-            currentRPM=(count*600.0)/PULSES_PER_REV;
-            filteredRPM = RPM_FILTER_ALPHA*currentRPM + (1-RPM_FILTER_ALPHA)*filteredRPM;
-            currentRPM = filteredRPM;
-            if (currentRPM > 10) lastRPMNonZero = now;
-            lastRPMCalc=now;
+            cli();
+            int cnt = pulseCount;
+            pulseCount = 0;
+            sei();
+            float rpm = (cnt * 600.0f) / PULSES_PER_REV;
+            filteredRPM = RPM_FILTER_ALPHA * rpm + (1 - RPM_FILTER_ALPHA) * filteredRPM;
+            currentRPM  = filteredRPM;
+            if (currentRPM > 10.0f) lastRPMNonZero = now;
+            lastRPMCalc = now;
         }
-        if (now - lastRPMNonZero > RPM_CHECK_TIMEOUT && pwmOutput>0) {
-            pwmOutput=0; pwm_write(pwm_map(pwmOutput)); uart_println("Safety Stop: RPM lost!");
+
+        //Safety stop if RPM lost 
+        if ((now - lastRPMNonZero > RPM_CHECK_TIMEOUT_MS)) {
+            pwm_write(pwm_map(0));
         }
-        if (now - lastPID >= 20) { doPID(); lastPID=now; }
+
+        // PID every ~20 ms.
+        if (now - pid.lastTime >= 20) {
+            doPID();
+        }
     }
 }
